@@ -3,7 +3,7 @@
         "db_name": "trading_vault.db",
         "ibkr_port": 7497,
         "log_level": "INFO",
-        "daily_data_source": "IBKR", 
+        "daily_data_source": "POLYGON", 
         "hourly_data_source": "POLYGON"
     },
     "scanner_settings": {
@@ -12,7 +12,16 @@
         "micro_timeframe": "1 hour",
         "volume_ma_length": 20,
         "breakout_lookback": 20,
-        "support_tolerance_pct": 0.007
+        "support_tolerance_pct": 0.007,
+        "max_pass2_candidates": 15,
+        "pass2_lookback_days": 30,
+        "pass2_timeframe": "1h",
+        "rsi_period": 14,
+        "bb_period": 20,
+        "bb_std": 2.0,
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9
     },
     "alpha_ranking_weights": {
         "strategy_confluence_pct": 40.0,
