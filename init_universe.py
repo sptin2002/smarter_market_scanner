@@ -44,10 +44,6 @@ class DataInitializationEngine:
         sys_settings = self.config.get("system_settings", {})
         self.db_name = sys_settings.get("db_name", "trading_vault.db")
         self.ib_port = sys_settings.get("ibkr_port", 7497)
-        
-        # FIXED: Explicitly capture both keys into instance memory safely
-        # self.poly_key = os.getenv("POLYGON_API_KEY")
-        # self.av_key = os.getenv("ALPHA_VANTAGE_API_KEY") or self.poly_key
 
         # Core isolation injection initialization 
         self.data_factory = HistoricalDataFactory(self.config)
@@ -71,7 +67,7 @@ class DataInitializationEngine:
                     close REAL,
                     volume INTEGER,
                     avg_sentiment REAL DEFAULT 0.0,
-                    news_volume INTEGER DEFAULT 0,
+                    news_volume INTEGER DEFAULT -1,
                     PRIMARY KEY (date, ticker)
                 )
             """)
@@ -100,37 +96,57 @@ class DataInitializationEngine:
 
         conn = sqlite3.connect(self.db_name)
         
-        # UPGRADED: Added loop tracking metrics
         for idx, symbol in enumerate(tickers, 1):
             pct = (idx / total) * 100
             logger.info(f"[{idx}/{total}] ({pct:.1f}%) Synchronizing daily candlestick records for: {symbol}")
             
-            # Check for existing records to leverage checkpoint safety
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM ticker_data WHERE ticker = ?", (symbol,))
-            if cursor.fetchone()[0] > 100:  # Skip if substantial baseline history is already loaded
-                continue
+            # Look up the newest date we already have stored for this stock
+            cursor.execute("SELECT MAX(date) FROM ticker_data WHERE ticker = ?", (symbol,))
+            res = cursor.fetchone()
+            
+            # Today's date is always our endpoint
+            end_date_str = datetime.today().strftime('%Y-%m-%d')
+            
+            if res and res[0]:
+                # If data exists, start fetching from the next calendar day
+                latest_date = datetime.strptime(res[0], '%Y-%m-%d')
+                start_date_str = (latest_date + timedelta(days=1)).strftime('%Y-%m-%d')
+                
+                # If we are already up-to-date, skip to save network overhead
+                if start_date_str > end_date_str:
+                    logger.info(f"   [->] {symbol} is already up to date.")
+                    continue
+            else:
+                # If the database is completely empty for this stock, fetch a full year
+                start_date_str = (datetime.today() - timedelta(days=365)).strftime('%Y-%m-%d')
 
             try:
-                # Direct lookup using data factory interfaces
-                df_daily = await self.data_factory.fetch_daily_bars(symbol, lookback_days=365)
+                # Direct lookup using standardized data factory interfaces (routes to Finnhub)
+                df_daily = await self.data_factory.fetch_daily_bars(symbol, start_date=start_date_str, end_date=end_date_str)
                 if not df_daily.empty:
                     payload = []
                     for _, row in df_daily.iterrows():
-                        # Standardize datetime sorting parameters
-                        date_str = row['timestamp'].strftime('%Y-%m-%d') if isinstance(row['timestamp'], datetime) else str(row['timestamp'])[:10]
+                        date_str = str(row['date'])[:10]
                         payload.append((
-                            date_str, symbol, float(row['open']), float(row['high']),
-                            float(row['low']), float(row['close']), int(row['volume'])
+                            date_str,
+                            symbol,
+                            float(row['open']),
+                            float(row['high']),
+                            float(row['low']),
+                            float(row['close']),
+                            int(row['volume'])
                         ))
                     
+                    # INSERT OR REPLACE ensures we overwrite duplicates safely if any slip through
                     conn.executemany("""
                         INSERT OR REPLACE INTO ticker_data (date, ticker, open, high, low, close, volume)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, payload)
                     conn.commit()
+                    logger.info(f"   [+] Successfully ingested {len(payload)} new day(s) for {symbol}")
             except Exception as e:
-                logger.error(f"     [ERROR] Failed to ingest price profile rows for asset {symbol}: {e}")
+                logger.error(f" [ERROR] Failed to ingest price profile rows for asset {symbol}: {e}")
                 
         conn.close()
 
@@ -142,49 +158,62 @@ class DataInitializationEngine:
         
         conn = sqlite3.connect(self.db_name)
         cursor = conn.cursor()
+
+        try:
         
-        # UPGRADED: Added loop tracking metrics
-        for idx, symbol in enumerate(tickers, 1):
-            pct = (idx / total) * 100
-            
-            # Checkpoint lookup to see if data already exists
-            cursor.execute("SELECT COUNT(*) FROM ticker_fundamentals WHERE ticker = ?", (symbol,))
-            if cursor.fetchone()[0] > 0:
-                logger.info(f"[{idx}/{total}] ({pct:.1f}%) -> {symbol} fundamentals already cached in local vault.")
-                continue
+            for idx, symbol in enumerate(tickers, 1):
+                pct = (idx / total) * 100
                 
-            logger.info(f"[{idx}/{total}] ({pct:.1f}%) -> Fetching fresh fundamentals matrix for: {symbol}")
-            
+                # Checkpoint lookup to see if data already exists
+                cursor.execute("SELECT COUNT(*) FROM ticker_fundamentals WHERE ticker = ?", (symbol,))
+                if cursor.fetchone()[0] > 0:
+                    logger.info(f"[{idx}/{total}] ({pct:.1f}%) -> {symbol} fundamentals already cached in local vault.")
+                    continue
+                    
+                logger.info(f"[{idx}/{total}] ({pct:.1f}%) -> Fetching fresh fundamentals matrix for: {symbol}")
+                
+                try:
+                    # REFACTORED: Now targets the exact multi-vendor endpoint method name
+                    df_fund = self.data_factory.fetch_company_fundamentals(symbol)
+                    
+                    if df_fund is not None and not df_fund.empty:
+                        payload = []
+                        for _, row in df_fund.iterrows():
+                            payload.append((
+                                symbol,
+                                str(row['announcement_date']),
+                                float(row['reported_eps']) if pd.notna(row['reported_eps']) else None,
+                                float(row['expected_eps']) if pd.notna(row['expected_eps']) else None,
+                                float(row['reported_rev']) if pd.notna(row['reported_rev']) else None,
+                                float(row['expected_rev']) if pd.notna(row['expected_rev']) else None
+                            ))
+                        
+                        cursor.executemany("""
+                            INSERT OR REPLACE INTO ticker_fundamentals 
+                            (ticker, announcement_date, reported_eps, expected_eps, reported_rev, expected_rev)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, payload)
+                        conn.commit()
+                        
+                        # Mandatory pacing interval to comply with standard free-tier API rate metrics
+                        time.sleep(12.0)
+                    else:
+                        logger.warning(f"     [!] Empty financial framework parsed from provider for asset {symbol}")
+                        
+                except Exception as e:
+                    logger.error(f"     [ERROR] Fundamental data collection aborted for asset {symbol}: {e}")
+
+        except KeyboardInterrupt:
+            # CRITICAL: Intercepts Ctrl+C globally to break the entire 496-asset sweep instantly
+            logger.warning("\n[!!!] Control-C Detected: Aborting synchronization loop cleanly...")
             try:
-                df_fund = self.data_factory.fetch_ticker_fundamentals(symbol)
-                
-                if df_fund is not None and not df_fund.empty:
-                    payload = []
-                    for _, row in df_fund.iterrows():
-                        payload.append((
-                            symbol,
-                            str(row['announcement_date']),
-                            float(row['reported_eps']) if pd.notna(row['reported_eps']) else None,
-                            float(row['expected_eps']) if pd.notna(row['expected_eps']) else None,
-                            float(row['reported_rev']) if pd.notna(row['reported_rev']) else None,
-                            float(row['expected_rev']) if pd.notna(row['expected_rev']) else None
-                        ))
-                    
-                    cursor.executemany("""
-                        INSERT OR REPLACE INTO ticker_fundamentals 
-                        (ticker, announcement_date, reported_eps, expected_eps, reported_rev, expected_rev)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, payload)
-                    conn.commit()
-                    
-                    # Mandatory pacing interval to comply with standard free-tier API rate metrics
-                    time.sleep(12.0)
-                else:
-                    logger.warning(f"     [!] Empty financial framework parsed from provider for asset {symbol}")
-                    
-            except Exception as e:
-                logger.error(f"     [ERROR] Fundamental data collection aborted for asset {symbol}: {e}")
-                
+                conn.rollback() # Roll back any uncommitted transactions to preserve DB state
+                conn.close()
+                self.data_factory.close()
+            except Exception:
+                pass
+            logger.info("[+] Active databases and network connections terminated safely. System exiting.")
+            sys.exit(1) # Force immediate system exit back to the terminal prompt  
         conn.close()
 
     def compute_vector_sentiment_batch(self, headlines: List[str], batch_size: int = 128) -> List[float]:
@@ -223,12 +252,11 @@ class DataInitializationEngine:
         
         conn = sqlite3.connect(self.db_name)
         
-        # UPGRADED: Added loop tracking metrics
         for idx, symbol in enumerate(tickers, 1):
             pct = (idx / total) * 100
             
             work_df = pd.read_sql(
-                f"SELECT date FROM ticker_data WHERE ticker='{symbol}' AND news_volume=0", conn
+                f"SELECT date FROM ticker_data WHERE ticker='{symbol}' AND news_volume=-1", conn
             )
             
             if work_df.empty:
@@ -240,12 +268,11 @@ class DataInitializationEngine:
             flattened_headlines = []
             date_indices = []
             
-            # Request endpoints directly to structural dictionary files
             for date_str in work_df['date']:
-                # Pull raw headlines using unified factory connection points
-                headlines = self.data_factory.fetch_raw_news_titles(symbol, date_str, date_str)
-                for t in headlines:
-                    flattened_headlines.append(t)
+                # REFACTORED: Calls the new unified news interface and unpacks structural dictionaries safely
+                news_items = self.data_factory.fetch_news_headlines(symbol, date_str, date_str)
+                for item in news_items:
+                    flattened_headlines.append(item["title"])
                     date_indices.append(date_str)
             
             mapped_results: Dict[str, List[float]] = {}
@@ -276,7 +303,8 @@ if __name__ == "__main__":
     load_dotenv()
     
     initializer = DataInitializationEngine(config_path="config.json")
-    # asyncio.run(initializer.sync_ibkr_prices())
-    initializer.sync_company_fundamentals()
-    # initializer.enrich_sentiment_pipeline()
+    # To run prices or news metrics, simply uncomment the target workflow line below:
+    asyncio.run(initializer.sync_ibkr_prices())
+    # initializer.sync_company_fundamentals()
+    initializer.enrich_sentiment_pipeline()
     logger.info("Initialization Sequence Execution Cycle Complete.")

@@ -12,10 +12,9 @@ from ib_insync import IB
 
 # Modular analytical frameworks imports
 from init_universe import DataInitializationEngine
-from scanner_logic import VectorizedScannerEngine
+from scanner_logic import VectorizedScannerEngine, EarningsMomentumScanner
 from data_factory import HistoricalDataFactory
 
-# FIXED: Ensure environment configurations load before initializing factories
 load_dotenv()
 
 def load_system_config() -> Dict[str, Any]:
@@ -25,8 +24,6 @@ def load_system_config() -> Dict[str, Any]:
 def load_macro_daily_data(db_name: str, tickers: List[str]) -> pd.DataFrame:
     conn = sqlite3.connect(db_name)
     ticker_placeholders = ",".join([f"'{t}'" for t in tickers])
-    # FIXED: Select avg_sentiment and news_volume parameters during Pass 1 sweep 
-    # to allow multi-factor alpha scoring immediately after Pass 1.
     query = f"""
         SELECT date, ticker, open, high, low, close, volume, avg_sentiment, news_volume
         FROM ticker_data 
@@ -40,30 +37,26 @@ def load_macro_daily_data(db_name: str, tickers: List[str]) -> pd.DataFrame:
 def fetch_alpha_metadata(db_name: str, ticker: str) -> Dict[str, Any]:
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT reported_eps, expected_eps, reported_rev, expected_rev 
-        FROM ticker_fundamentals WHERE ticker=? ORDER BY announcement_date DESC LIMIT 1
-    """, (ticker,))
-    fund_row = cursor.fetchone()
-    
-    cursor.execute("""
-        SELECT avg_sentiment, news_volume FROM ticker_data 
-        WHERE ticker=? AND avg_sentiment IS NOT NULL ORDER BY date DESC LIMIT 1
-    """, (ticker,))
-    sent_row = cursor.fetchone()
-    conn.close()
-    
-    eps_str = f"EPS: Rep={fund_row[0]} Exp={fund_row[1]}" if fund_row else "EPS: N/A"
-    rev_str = f"Rev: Rep={fund_row[2]} Exp={fund_row[3]}" if fund_row else "Rev: N/A"
-    sentiment = float(sent_row[0]) if sent_row else 0.0
-    volume = int(sent_row[1]) if sent_row else 0
-    
-    return {
-        "eps": eps_str,
-        "revenue": rev_str,
-        "sentiment": sentiment,
-        "news_volume": volume
-    }
+    meta = {"revenue": "N/A Surprise Data", "eps": "N/A Surprise Data", "surprise_pct": 0.0}
+    try:
+        cursor.execute("""
+            SELECT revenue_surprise_pct, eps_surprise_pct 
+            FROM ticker_fundamentals 
+            WHERE ticker = ? 
+            ORDER BY announcement_date DESC LIMIT 1
+        """, (ticker.upper(),))
+        row = cursor.fetchone()
+        if row:
+            rev_s = row[0] if row[0] is not None else 0.0
+            eps_s = row[1] if row[1] is not None else 0.0
+            meta["revenue"] = f"Rev Surprise: {rev_s:+.2f}%"
+            meta["eps"] = f"EPS Surprise: {eps_s:+.2f}%"
+            meta["surprise_pct"] = float((abs(rev_s) + abs(eps_s)) / 2.0)
+    except Exception:
+        pass
+    finally:
+        conn.close()
+    return meta
 
 async def main_async():
     print("="*90)
@@ -72,18 +65,13 @@ async def main_async():
     
     config = load_system_config()
     sys_settings = config.get("system_settings", {})
-    scanner_settings = config.get("scanner_settings", {})
-    weights = config.get("alpha_ranking_weights", {})
-    
     db_name = sys_settings.get("db_name", "trading_vault.db")
     tickers = config.get("trading_universe", {}).get("tickers", [])
-    max_shortlist = scanner_settings.get("max_shortlist_size", 25)
-    lookback_days = scanner_settings.get("pass2_lookback_days", 30)
     
     if not tickers:
-        print("[!] Execution universe is empty. Verify config.json architecture configurations.")
+        print("[!] Execution universe array is empty inside config.json.")
         return
-        
+
     print(f"[*] Executing Pass 1 Macro Analysis across [{len(tickers)}] securities...")
     df_daily = load_macro_daily_data(db_name, tickers)
     
@@ -91,144 +79,133 @@ async def main_async():
         print("[!] No clean baseline macro daily historical data sequences found inside target SQLite vault.")
         return
         
-    scanner = VectorizedScannerEngine(atr_lookback=config.get("risk_management", {}).get("atr_lookback", 14))
+    # Phase 1: Initialize the engine with the full configuration profile
+    scanner = VectorizedScannerEngine(config)
     df_analyzed, shortlist_signals = scanner.compute_daily_matrices(df_daily)
     
     shortlist_keys = list(shortlist_signals.keys())
     print(f"[+] Pass 1 Complete. Matrix tracking flagged [{len(shortlist_keys)}] candidates.")
+    print("[*] Computing Dynamic Multi-Factor Alpha Ranking scores for Pass 1 Shortlist...")
     
-    if not shortlist_keys:
-        print("[-] Pipeline process terminated: No tickers qualified during primary vector tracking passes.")
-        return
-        
-    print("[*] Computing Multi-Factor Alpha Ranking scores for Pass 1 Shortlist...")
-    ranked_candidates = []
+    # Initialize the time-decay weight calculation routine
+    decay_engine = EarningsMomentumScanner(config, db_name)
+    current_scan_date = datetime.today().strftime('%Y-%m-%d')
+    
+    alpha_ranked_pool = []
+    data_factory = HistoricalDataFactory(config)
+
     for ticker in shortlist_keys:
         sig_info = shortlist_signals[ticker]
         
-        # Pull last state rows to extract technical alpha weights
-        t_rows = df_analyzed[df_analyzed['ticker'] == ticker]
-        if t_rows.empty:
-            continue
-        last_row = t_rows.iloc[-1]
+        # Calculate dynamic time-decay weights per asset
+        adj_weights = decay_engine.compute_decayed_weights(ticker, current_scan_date)
         
-        # Calculate Technical Core Base Component
-        tech_score = float(sig_info["score_multiplier"]) * float(weights.get("strategy_confluence_pct", 40.0))
+        # Technical Score Component: Resolve key drift safely via standard fallbacks
+        multiplier_key = next((k for k in ["score_multiplier", "confluence_multiplier", "confluence_score", "active_setups_count"] if k in sig_info), None)
+        if multiplier_key:
+            raw_mult = float(sig_info[multiplier_key])
+            if multiplier_key == "active_setups_count" and raw_mult > 1.0:
+                raw_mult = raw_mult / float(sig_info.get("total_setups", 9.0))
+            score_multiplier = raw_mult
+        else:
+            score_multiplier = 0.5
+            
+        tech_score = score_multiplier * float(adj_weights["strategy_confluence_pct"])
+
+        # Momentum Score Component: Distance from average baseline velocity
+        rsi_val = float(sig_info.get("rsi", 50.0))
+        momentum_score = (rsi_val / 100.0) * float(adj_weights["momentum_velocity_pct"])
         
-        # Calculate Momentum Component (e.g. tracking close relative to structural moving averages)
-        mom_score = 0.0
-        if last_row.get('sma_20') and last_row['sma_20'] > 0:
-            mom_score = ((last_row['close'] - last_row['sma_20']) / last_row['sma_20']) * float(weights.get("momentum_velocity_pct", 40.0))
+        # Alternative Sentiment Component Engine
+        ticker_rows = df_daily[df_daily['ticker'] == ticker]
+        if not ticker_rows.empty:
+            last_row = ticker_rows.iloc[-1]
+            raw_sent = float(last_row.get('avg_sentiment', 0.0))
+            raw_vol = float(last_row.get('news_volume', 0.0))
+            confidence_multiplier = min(raw_vol / 5.0, 1.0)
+            sentiment_score = (raw_sent * confidence_multiplier * float(adj_weights["news_sentiment_pct"]))
+        else:
+            raw_sent, raw_vol, sentiment_score = 0.0, 0.0, 0.0
             
-        # Calculate Alternative Fundamental Sentiment Component
-        sent_score = 0.0
-        avg_sent = last_row.get('avg_sentiment', 0.0)
-        news_vol = last_row.get('news_volume', 0)
-        if avg_sent and news_vol > 0:
-            confidence = min(float(news_vol) / 5.0, 1.0)
-            sent_score = (float(avg_sent) * confidence) * float(weights.get("sentiment_tailwind_pct", 20.0))
-            
-        composite_alpha = tech_score + mom_score + sent_score
-        ranked_candidates.append({
+        # Fundamental PEAD Shock Component Engine
+        fund_meta = fetch_alpha_metadata(db_name, ticker)
+        fundamental_shock_score = (min(fund_meta["surprise_pct"] / 100.0, 1.0) * float(adj_weights["earnings_surprise_pct"]))
+
+        # Composite Multi-Factor Rank Mapping
+        composite_alpha_score = tech_score + momentum_score + sentiment_score + fundamental_shock_score
+        
+        # Form structural tracking metrics payloads
+        alpha_ranked_pool.append({
             "ticker": ticker,
-            "score": composite_alpha,
-            "tech_base": tech_score,
-            "tailwind": sent_score,
-            "info": sig_info
+            "score": composite_alpha_score,
+            "weights_used": adj_weights,
+            "info": sig_info,
+            "meta": {
+                "revenue": fund_meta["revenue"],
+                "eps": fund_meta["eps"],
+                "sentiment": raw_sent,
+                "news_volume": raw_vol
+            }
         })
-        
-    ranked_candidates = sorted(ranked_candidates, key=lambda x: x["score"], reverse=True)
-    shortlist_keys = [c["ticker"] for c in ranked_candidates[:max_shortlist]]
-    
-    print(f"[+] Multi-Factor filtering compressed execution scope down to the top [{len(shortlist_keys)}] assets.")
-    
-    data_factory = HistoricalDataFactory(config)
-    ib_client = None
-    if data_factory.hourly_source == "IBKR":
-        try:
-            ib_client = IB()
-            await ib_client.connectAsync('127.0.0.1', data_factory.ib_port, clientId=99)
-        except Exception as e:
-            print(f"[!] Warning: Failed to boot secondary async IBKR connection state link: {e}")
-            print("    Reverting fallback systems to stateless connections where applicable.")
-            ib_client = None
 
-    print(f"[*] Dispatching Pass 2 lower timeframe confirmation via configured channel: {data_factory.hourly_source}")
+    # Sort candidates by descending alpha score profiles
+    alpha_ranked_pool = sorted(alpha_ranked_pool, key=lambda x: x["score"], reverse=True)
+    target_shortlist = alpha_ranked_pool[:int(config.get("scanner_settings", {}).get("max_pass2_candidates", 15))]
     
-    selected_targets = []
-    total_candidates = len(shortlist_keys)
-    
-    # UPGRADED: Added counter loop with percentage math to prevent frozen terminal perception
-    for idx, ticker in enumerate(shortlist_keys, 1):
-        pct = (idx / total_candidates) * 100
-        print(f"  [{idx}/{total_candidates}] ({pct:.1f}%) Extracting intraday hourly structures for: {ticker}")
-        
+    print(f"[+] Ranking Complete. Formed top allocation shortlist of [{len(target_shortlist)}] targets.")
+    print("[*] Initiating Pass 2 Micro-Timeframe Intraday Validation...")
+
+    final_selected_targets = []
+    end_date_str = datetime.today().strftime('%Y-%m-%d')
+    start_date_str = (datetime.today() - timedelta(days=int(config.get("scanner_settings", {}).get("pass2_lookback_days", 30)))).strftime('%Y-%m-%d')
+
+    for target in target_shortlist:
+        ticker = target["ticker"]
         try:
-            df_hourly = await data_factory.fetch_hourly_bars(ticker, lookback_days, ib_client)
+            # Dynamically fetch lower-timeframe intraday profiles
+            df_hourly = await data_factory.fetch_hourly_bars(ticker, start_date=start_date_str, end_date=end_date_str)
+            passed_micro, confluence_msg = scanner.verify_micro_confluence(df_hourly)
             
-            if df_hourly.empty:
-                print(f"      [!] Empty data payload returned for {ticker}. Skipping validation.")
-                continue
-                
-            is_confirmed, confluence_msg = scanner.verify_micro_confluence(df_hourly)
-            if is_confirmed:
-                print(f"      [✓] PASS 2 CONFIRMED: {ticker} matched lower timeframe confluence rules.")
-                # Match meta records back out of original alpha sorting array
-                orig_meta = next(item for item in ranked_candidates if item["ticker"] == ticker)
-                meta_ext = fetch_alpha_metadata(db_name, ticker)
-                
-                selected_targets.append({
-                    "ticker": ticker,
-                    "score": orig_meta["score"],
-                    "tailwind": orig_meta["tailwind"],
-                    "info": orig_meta["info"],
-                    "meta": meta_ext,
-                    "confluence_msg": confluence_msg
-                })
+            if passed_micro:
+                target["confluence_msg"] = confluence_msg
+                final_selected_targets.append(target)
+                print(f"  -> [✓] {ticker} verified successfully on intraday timeframes.")
             else:
-                print(f"      [x] Pass 2 Rejected: {ticker} failed intraday confirmation.")
-                
+                print(f"  -> [❌] {ticker} filtered out: {confluence_msg}")
         except Exception as e:
-            print(f"      [ERROR] Fatal structural error handling pass 2 validation for {ticker}: {e}")
+            print(f"  -> [!] Bypassed {ticker} due to data fetching exception: {e}")
 
-    if ib_client and ib_client.isConnected():
-        ib_client.disconnect()
-    data_factory.close()
-
+    # Output executive summary metrics reports
     print("\n" + "="*90)
-    print(" HIGH CONVICTION SYSTEM SIGNAL TARGET MATRIX ENGINE REPORT")
+    print(" EXECUTIVE QUANT ALPHA SCANNER SEARCH SEED TERMINAL REPORT")
     print("="*90)
-    
-    # Sort remaining assets by score final output checks
-    final_selected_targets = sorted(selected_targets, key=lambda x: x["score"], reverse=True)
     
     for rank, target in enumerate(final_selected_targets, 1):
         ticker = target["ticker"]
         info = target["info"]
         meta = target["meta"]
+        w = target["weights_used"]
         sentiment_status = "BULLISH" if meta["sentiment"] > 0.10 else "BEARISH" if meta["sentiment"] < -0.10 else "NEUTRAL"
         
         print(f"\n[RANK #{rank} TARGET ACQUISITION LOCK: {ticker.upper()}]")
-        print(f"  System Alpha Ranking Score: {target['score']:.2f} | DEFENSIVE COMPOSITE TAILWIND MATRIX SCORE: {target['tailwind']:.4f}")
-        print(f"  Daily Close Price: ${info['close']:.2f} | Dynamic Stop Range (2x ATR): ${info['atr']*2:.2f}")
-        print("-" * 75)
-        print("  Precise Mathematical & Geometric Trade Logic Justification:")
+        print(f"  System Combined Alpha Score: {target['score']:.2f} | Days Since Earnings: {w['days_since_earnings']}")
+        print(f"  Dynamic Allocation Profiles: PEAD Shock: {w['earnings_surprise_pct']:.1f}% | Tech: {w['strategy_confluence_pct']:.1f}% | Mom: {w['momentum_velocity_pct']:.1f}%")
+        print(f"  Daily Close Price: ${info['close']:.2f} | Dynamic Stop Tracking Range (2x ATR): ${info['atr']*2:.2f}")
+        print("-" * 80)
+        print("  Active Technical Setup Multipliers Found:")
         for justification in info["justifications"]:
-            print(f"   -> {justification}")
+            print(f"   -> [✓] {justification}")
             
-        print("\n  Lower Timeframe Execution Confluence Metrics:")
-        print(f"   [Micro Confirmation]: {target['confluence_msg']}")
-        
-        print("\n  Fundamental & Narrative Alpha Overlay Metrics:")
-        print(f"   - Corporate Financial Status: {meta['revenue']} | {meta['eps']}")
-        print(f"   - Alternative NLP News Ingestion: Media Tone: {meta['sentiment']:.3f} [{sentiment_status} via {meta['news_volume']} Headlines]")
+        print("\n  Lower Timeframe Confirmation Confluence Metrics:")
+        print(f"   [Micro Footprint]: {target['confluence_msg']}")
+        print(f"   - NLP Alternative News Score: {meta['sentiment']:.3f} [{sentiment_status} over {int(meta['news_volume'])} headlines]")
         print("="*90)
 
     if not final_selected_targets:
         print("\n[!] Scanning loop complete: Zero structural targets satisfied both Pass 1 & Pass 2 thresholds.")
         print("="*90)
+        
+    data_factory.close()
 
 if __name__ == "__main__":
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main_async())

@@ -3,8 +3,10 @@
         "db_name": "trading_vault.db",
         "ibkr_port": 7497,
         "log_level": "INFO",
-        "daily_data_source": "POLYGON", 
-        "hourly_data_source": "POLYGON"
+        "daily_data_source": "POLYGON",
+        "hourly_data_source": "POLYGON",
+        "fundamentals_data_source": "FINNHUB",
+        "sentiment_data_source": "FINNHUB"
     },
     "scanner_settings": {
         "max_shortlist_size": 25,
@@ -24,9 +26,15 @@
         "macd_signal": 9
     },
     "alpha_ranking_weights": {
-        "strategy_confluence_pct": 40.0,
-        "momentum_velocity_pct": 40.0,
-        "sentiment_tailwind_pct": 20.0
+        "base_weights": {
+            "strategy_confluence_pct": 45.0,
+            "momentum_velocity_pct": 35.0,
+            "news_sentiment_pct": 20.0
+        },
+        "earnings_surprise": {
+            "max_initial_weight_pct": 30.0,
+            "half_life_days": 15.0
+        }
     },
     "horizon_parameters": {
         "min_holding_days": 3,
