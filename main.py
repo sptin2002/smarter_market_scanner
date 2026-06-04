@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from ib_insync import IB
 
 # Modular analytical frameworks imports
+from alert_dispatcher import TelegramAlertDispatcher
 from init_universe import DataInitializationEngine
 from scanner_logic import VectorizedScannerEngine, EarningsMomentumScanner
 from data_factory import HistoricalDataFactory
@@ -175,10 +176,30 @@ async def main_async():
         except Exception as e:
             print(f"  -> [!] Bypassed {ticker} due to data fetching exception: {e}")
 
-    # Output executive summary metrics reports
-    print("\n" + "="*90)
-    print(" EXECUTIVE QUANT ALPHA SCANNER SEARCH SEED TERMINAL REPORT")
-    print("="*90)
+    # =========================================================================
+    # ENHANCED REPORTING LAYER: WRITE TO TERMINAL & FILE SYSTEM
+    # =========================================================================
+    
+    # 1. Ensure the output directory folder exists
+    output_folder = "scan-results"
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # 2. Format filename dynamically using the execution date (e.g., June-15-2026.txt)
+    date_filename = datetime.today().strftime('%B-%d-%Y') + ".txt"
+    file_write_path = os.path.join(output_folder, date_filename)
+    
+    # 3. Create a tracking bucket for file contents
+    report_buffer = []
+
+    def log_and_collect(text_line: str):
+        """Helper to output to terminal and buffer for file generation at the same time."""
+        print(text_line)
+        report_buffer.append(text_line)
+
+    # Begin constructing executive document content
+    log_and_collect("=" * 90)
+    log_and_collect(f" EXECUTIVE QUANT ALPHA SCANNER REPORT | GENERATED: {datetime.today().strftime('%Y-%m-%d %H:%M:%S')}")
+    log_and_collect("=" * 90)
     
     for rank, target in enumerate(final_selected_targets, 1):
         ticker = target["ticker"]
@@ -187,23 +208,36 @@ async def main_async():
         w = target["weights_used"]
         sentiment_status = "BULLISH" if meta["sentiment"] > 0.10 else "BEARISH" if meta["sentiment"] < -0.10 else "NEUTRAL"
         
-        print(f"\n[RANK #{rank} TARGET ACQUISITION LOCK: {ticker.upper()}]")
-        print(f"  System Combined Alpha Score: {target['score']:.2f} | Days Since Earnings: {w['days_since_earnings']}")
-        print(f"  Dynamic Allocation Profiles: PEAD Shock: {w['earnings_surprise_pct']:.1f}% | Tech: {w['strategy_confluence_pct']:.1f}% | Mom: {w['momentum_velocity_pct']:.1f}%")
-        print(f"  Daily Close Price: ${info['close']:.2f} | Dynamic Stop Tracking Range (2x ATR): ${info['atr']*2:.2f}")
-        print("-" * 80)
-        print("  Active Technical Setup Multipliers Found:")
+        log_and_collect(f"\n[RANK #{rank} TARGET ACQUISITION LOCK: {ticker.upper()}]")
+        log_and_collect(f"  System Combined Alpha Score: {target['score']:.2f} | Days Since Earnings: {w['days_since_earnings']}")
+        log_and_collect(f"  Dynamic Allocation Profiles: PEAD Shock: {w['earnings_surprise_pct']:.1f}% | Tech: {w['strategy_confluence_pct']:.1f}% | Mom: {w['momentum_velocity_pct']:.1f}%")
+        log_and_collect(f"  Daily Close Price: ${info['close']:.2f} | Dynamic Stop Tracking Range (2x ATR): ${info['atr']*2:.2f}")
+        log_and_collect("-" * 80)
+        log_and_collect("  Active Technical Setup Multipliers Found:")
         for justification in info["justifications"]:
-            print(f"   -> [✓] {justification}")
+            log_and_collect(f"   -> [✓] {justification}")
             
-        print("\n  Lower Timeframe Confirmation Confluence Metrics:")
-        print(f"   [Micro Footprint]: {target['confluence_msg']}")
-        print(f"   - NLP Alternative News Score: {meta['sentiment']:.3f} [{sentiment_status} over {int(meta['news_volume'])} headlines]")
-        print("="*90)
+        log_and_collect("\n  Lower Timeframe Confirmation Confluence Metrics:")
+        log_and_collect(f"   [Micro Footprint]: {target['confluence_msg']}")
+        log_and_collect(f"   - NLP Alternative News Score: {meta['sentiment']:.3f} [{sentiment_status} over {int(meta['news_volume'])} headlines]")
+        log_and_collect("=" * 90)
 
     if not final_selected_targets:
-        print("\n[!] Scanning loop complete: Zero structural targets satisfied both Pass 1 & Pass 2 thresholds.")
-        print("="*90)
+        log_and_collect("\n[!] Scanning loop complete: Zero structural targets satisfied both Pass 1 & Pass 2 thresholds.")
+        log_and_collect("=" * 90)
+        
+    # 4. Commit compiled buffer lines into the permanent file path
+    with open(file_write_path, "w", encoding="utf-8") as report_file:
+        report_file.write("\n".join(report_buffer) + "\n")
+        
+    print(f"\n[+] Executive summary report written successfully to: {file_write_path}")
+
+    dispatcher = TelegramAlertDispatcher()
+    caption = f"📊 Alpha Market Scanner Report - {datetime.today().strftime('%B %d, %Y')} ({len(final_selected_targets)} targets identified)"
+    
+    await asyncio.to_thread(dispatcher.broadcast_document, file_write_path, caption)
+    
+    print("=" * 90)
         
     data_factory.close()
 
