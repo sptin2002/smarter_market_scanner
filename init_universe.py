@@ -305,6 +305,6 @@ if __name__ == "__main__":
     initializer = DataInitializationEngine(config_path="config.json")
     # To run prices or news metrics, simply uncomment the target workflow line below:
     asyncio.run(initializer.sync_ibkr_prices())
-    # initializer.sync_company_fundamentals()
+    initializer.sync_company_fundamentals()
     initializer.enrich_sentiment_pipeline()
     logger.info("Initialization Sequence Execution Cycle Complete.")
