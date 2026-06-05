@@ -7,6 +7,7 @@ import asyncio
 import pandas as pd
 import numpy as np
 import time
+from transformers import BertTokenizer
 from typing import List, Dict, Any, Tuple
 from datetime import datetime, timedelta
 from transformers import AutoTokenizer
@@ -38,7 +39,8 @@ class DataInitializationEngine:
         self._initialize_vault_schema()
         
         # Initialize the Tokenizer and ONNX Session once at startup for optimal performance
-        self.tokenizer = AutoTokenizer.from_pretrained(LOCAL_FINBERT_DIR, local_files_only=True, use_fast=True)
+        # self.tokenizer = AutoTokenizer.from_pretrained(LOCAL_FINBERT_DIR, local_files_only=True, use_fast=True)
+        self.tokenizer = BertTokenizer.from_pretrained(LOCAL_FINBERT_DIR, local_files_only=True)
         
         onnx_model_path = os.path.join(LOCAL_FINBERT_DIR, "finbert.onnx")
         if not os.path.exists(onnx_model_path):
