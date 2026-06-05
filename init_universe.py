@@ -38,7 +38,7 @@ class DataInitializationEngine:
         self._initialize_vault_schema()
         
         # Initialize the Tokenizer and ONNX Session once at startup for optimal performance
-        self.tokenizer = AutoTokenizer.from_pretrained(LOCAL_FINBERT_DIR, local_files_only=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(LOCAL_FINBERT_DIR, local_files_only=True, use_fast=True)
         
         onnx_model_path = os.path.join(LOCAL_FINBERT_DIR, "finbert.onnx")
         if not os.path.exists(onnx_model_path):
